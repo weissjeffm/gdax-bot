@@ -107,7 +107,6 @@
         newest (first trades)]
     (- (:price newest) (:price oldest))))
 
-(def api-key "47650dc5fdff0c981e607756dda96949")
 
 (defonce hmac (javax.crypto.Mac/getInstance "HmacSHA256"))
 
@@ -147,7 +146,7 @@
 
 (defn post [url body]
   (with-coinbase-auth
-    (http/post url (assoc *credentials* {:body body}))))
+    (http/post url (assoc *credentials* :body body :content-type :json))))
 
 (defn url [path]
   (format "%s%s" api-url path))
@@ -165,16 +164,16 @@
 
 (defn sell-bitcoin [amount price]
   (post (url "/orders")
-        {:type "limit"
-         :side "sell"
-         :price price
-         :size amount
-         :product_id "BTC-USD"}))
+        (json/write-str {:type "limit"
+                         :side "sell"
+                         :price price
+                         :size amount
+                         :product_id "BTC-USD"})))
 
 (defn buy-bitcoin [amount price]
   (post (url "/orders")
-        {:type "limit"
-         :side "buy"
-         :price price
-         :size amount
-         :product_id "BTC-USD"}))
+        (json/write-str {:type "limit"
+                         :side "buy"
+                         :price price
+                         :size amount
+                         :product_id "BTC-USD"})))
