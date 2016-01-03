@@ -12,7 +12,8 @@
   (:import [java.util Base64]
            [javax.crypto.spec SecretKeySpec]
            [javax.crypto Mac]
-           [java.net URL])
+           [java.net URL]
+           [java.util UUID])
   (:refer-clojure :exclude [get]))
 
 (defn create-feed-client [endpoint f]
@@ -21,6 +22,7 @@
     conn))
 
 (def ws-url "wss://ws-feed-public.sandbox.exchange.coinbase.com")
+(def ws-url "wss://ws-feed.exchange.coinbase.com")
 (def api-url "https://api-public.sandbox.exchange.coinbase.com")
 (def api-url "https://api.exchange.coinbase.com")
 
@@ -30,13 +32,16 @@
   (let [[price amount id] entry]
     [(read-string price) (read-string amount) id]))
 
+(defn json-read-str [s]
+  (json/read-str s :key-fn keyword))
+
 (defn order-book
   "Get the order book from the exchange"
   []
   (-> (http/get (format "%s%s" api-url "/products/BTC-USD/book")
                 {:query-params {:level 3}})
       :body
-      (json/read-str :key-fn keyword)
+      json-read-str
       (update-in [:bids] (partial map parse-orderbook-entry))
       (update-in [:asks] (partial map parse-orderbook-entry))))
 
@@ -67,7 +72,7 @@
                                 (when page-id {:query-params {"after" page-id}})))
          trades (-> response
                     :body
-                    (json/read-str :key-fn keyword))
+                    json-read-str)
          next-page-id (-> response :headers (clojure.core/get "cb-before"))]
      [trades next-page-id])))
 
@@ -160,20 +165,44 @@
             (-> acct
                 (update-in [:available] read-string)
                 (update-in [:balance] read-string)))]
-    (map parse-account (-> "/accounts" url get :body (json/read-str :key-fn keyword)))))
+    (map parse-account (-> "/accounts" url get :body json-read-str))))
+
+(defn place-order [order]
+  (->> order
+       json/write-str
+       (post (url "/orders"))
+       :body
+       json-read-str))
 
 (defn sell-bitcoin [amount price]
-  (post (url "/orders")
-        (json/write-str {:type "limit"
-                         :side "sell"
-                         :price price
-                         :size amount
-                         :product_id "BTC-USD"})))
+  (place-order {:type "limit"
+                :side "sell"
+                :price price
+                :size amount
+                :product_id "BTC-USD"}))
 
 (defn buy-bitcoin [amount price]
-  (post (url "/orders")
-        (json/write-str {:type "limit"
-                         :side "buy"
-                         :price price
-                         :size amount
-                         :product_id "BTC-USD"})))
+  (place-order {:type "limit"
+                :side "buy"
+                :price price
+                :size amount
+                :product_id "BTC-USD"}))
+
+(defn kill-all-orders []
+  (with-coinbase-auth
+    (http/delete (url "/orders") *credentials*)))
+
+(defn orders []
+  (with-coinbase-auth
+    (http/get (url "/orders") *credentials*)))
+
+(defn best-orders []
+  (-> "/products/BTC-USD/book"
+      url
+      (http/get {:query-params {:level 1}})
+      :body
+      json-read-str))
+
+(defn fills []
+  (with-coinbase-auth
+    (-> "/fills" url (http/get *credentials*) :body json-read-str)))
