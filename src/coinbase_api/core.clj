@@ -19,7 +19,9 @@
   (:refer-clojure :exclude [get]))
 
 (defonce current-price (atom nil))
-(defonce current-order-book (atom {:bids {} :asks {}}))
+(defonce current-order-book (atom {:sequence 0
+                                   :bids (sorted-map-by >)
+                                   :asks (sorted-map-by <)}))
 (defonce feed-watchers (atom {}))
 
 (def ws-url "wss://ws-feed-public.sandbox.exchange.coinbase.com")
@@ -76,6 +78,9 @@
   [entry]
   (let [[price amount id] entry]
     [(read-string price) (read-string amount) id]))
+
+(defn order-book-insert [order-book feed-item]
+  )
 
 (defn order-book
   "Get the order book from the exchange"
