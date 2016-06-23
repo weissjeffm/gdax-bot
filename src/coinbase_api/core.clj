@@ -218,6 +218,13 @@
                 (update-in [:balance] read-string)))]
     (map parse-account (-> "/accounts" url get :body json-read-str))))
 
+(defn available-balance "Where currency is \"BTC\", \"USD\" etc"
+  [currency]
+  (->> (accounts)
+       (filter #(= (:currency %) currency))
+       first
+       :available))
+
 (defn place-order
   "Places an order and returns the id."
   [order]
