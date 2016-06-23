@@ -322,7 +322,7 @@
     (try (let [order-id (place-order (limit-order buy? size price))
                fill-ch (a/chan)
                sub (a/sub match-pub [order-id "match"] fill-ch)]
-           (println (format "%s %f at %f, expires in %d ms"
+           #_(println (format "%s %f at %f, expires in %d ms"
                             (if buy? "Buying" "Selling")
                             (float size)
                             (float price)
@@ -335,7 +335,7 @@
                     (on-fill-hook feed-item))
                    feed-item)
                ;; timed out, cancel
-               (do (println "killing order" order-id)
+               (do ;(println "killing order" order-id)
                    (kill-order order-id)))))
         (catch Exception e
           (.printStackTrace e)))))
@@ -420,4 +420,4 @@
 
           (Math/log 7200)
 
-          (map #(Math/log %) [60 300 3600 21600 86400 608400]))
+          (map #(Math/log %) [60 300 3600 21600 86400 608400])))
