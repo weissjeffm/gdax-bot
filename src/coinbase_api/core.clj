@@ -348,10 +348,11 @@
         (trade-on-change-lifecycle rounded-price size buy? timescale nil match-pub)))
     (let [[v ch] (a/alts! [shutdown-ch (a/timeout (int (/ timescale overlap-factor)))])]
       (when-not (= ch shutdown-ch)
-        (recur)))))
+        (recur))))
+  (kill-all-orders))
 
 (comment
- (expected-price 580.0 0.002 0.0045 0.25)
+ (expected-price 580.0 0.004 0.012 0.005)
   (:startup (do
 
 
