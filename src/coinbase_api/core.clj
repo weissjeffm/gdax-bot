@@ -344,7 +344,7 @@
 
 (defn trade-loop [min-bet probability-bets timescale overlap-factor match-pub shutdown-ch]
   (a/go-loop []
-    (doseq [[probability bet-scale] probability-bets]
+    (doseq [[probability bet-scale] (deref probability-bets)]
       (let [cur-price @current-price
             [mu sigma] (timescales timescale)
             exp-price (expected-price cur-price mu sigma probability)
