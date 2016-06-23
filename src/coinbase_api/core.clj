@@ -286,19 +286,27 @@
   {0.1 1.0, 0.01 2.0, 0.001 4.0,
    0.9 1.0, 0.99 2.0, 0.999 4.0}
   )
+(def narrow-probability-bets
+  {0.25 1.0, 0.15 2.0, 0.1 4.0,
+   0.75 1.0, 0.85 2.0, 0.9 4.0})
 
-(def timescales {60000 [0.002 0.0075] ;; with mu and sigma for lognormal dist
+(def mostly-buy-probability-bets
+  {0.1 0.2, 0.02 1.0, 0.005 2.0
+   0.9 0.05, 0.98 0.2, 0.995 0.4})
+
+(def timescales {60000 [0.002 0.0045] ;; with mu and sigma for lognormal dist
                  (* 10 60000) [0.004 0.012]
                  (* 100 60000) [0.016 0.032]
                  (* 1000 60000) [0.032 0.076]
                  (* 10000 60000) [0.086 0.19]})
 
-(defn round-price
+(defn round-number
   "Round a double to the given precision (number of significant digits)"
-  [p]
-  (let [factor 100.0]
-    (/ (Math/round (* p factor)) factor)))
+  [factor p]
+  (/ (Math/round (* p factor)) factor))
 
+(def round-price (partial round-number 100.0))
+(def round-bitcoin (partial round-number 10000000.0))
 (defn trade-on-change-lifecycle
   "When the order is filled, call on-fill-hook with the feed item. If
    order isn't filled by the ttl, cancel the order."
@@ -335,7 +343,7 @@
             exp-price (expected-price cur-price mu sigma probability)
             rounded-price (round-price exp-price)
             buy? (< exp-price cur-price)
-            size (* min-bet bet-scale)]
+            size (round-bitcoin (* min-bet bet-scale))]
         (a/<! (a/timeout 200))
         (trade-on-change-lifecycle rounded-price size buy? timescale nil match-pub)))
     (let [[v ch] (a/alts! [shutdown-ch (a/timeout (int (/ timescale overlap-factor)))])]
