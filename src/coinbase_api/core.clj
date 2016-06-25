@@ -32,13 +32,13 @@
 (defn json-read-str [s]
   (json/read-str s :key-fn keyword))
 
-(defn create-feed-client [endpoint]
-  (let [ch (a/chan (a/sliding-buffer 100))
-        conn (ws/connect endpoint :on-receive (fn [v]
-                                                (a/put! ch (json-read-str v))))]
+(defn create-feed-client [ch]
+  (println "Creating new feed client")
+  (let [conn (ws/connect ws-url :on-receive (fn [v]
+                                              (a/put! ch (json-read-str v))))]
     (ws/send-msg conn (json/write-str {:type "subscribe" :product_id "BTC-USD"}))
-    {:conn conn
-     :out ch}))
+    (ws/send-msg conn (json/write-str {:type "heartbeat" :on true}))
+    conn))
 
 (defn pub-sub [feed-ch]
   (let [m (a/mult feed-ch)
@@ -46,8 +46,8 @@
         out2 (a/chan)]
     (a/tap m out1)
     (a/tap m out2)
-    {:by-type (a/pub out1 :type (constantly 100))
-     :by-order-id-type (a/pub out2 (juxt :order_id :type))}))
+    {:by-type (a/pub out1 :type (fn [_] (a/sliding-buffer 100)))
+     :by-order-id-type (a/pub out2 (juxt :order_id :type) (fn [_] (a/sliding-buffer 10)))}))
 
 (defn keep-current-price-updated [match-ch price-atom]
   (a/go-loop []
@@ -55,12 +55,37 @@
       (reset! price-atom (-> match :price read-string))
       (recur))))
 
-(defn init-feed []
-  (let [{:keys [conn out]} (create-feed-client ws-url)
-        pubs (pub-sub out)
+(defonce websocket-heartbeat? (atom nil))
+
+(defn keep-feed-running [feed-chan by-type-pub shutdown-ch]
+  (let [hb-ch (a/chan (a/sliding-buffer 1))]
+    (a/sub by-type-pub "heartbeat" hb-ch)
+    (a/go-loop [conn nil]
+      (let [[_ ch] (a/alts! [hb-ch (a/timeout 15000) shutdown-ch])]
+        (cond (= ch hb-ch)
+              (do
+                (reset! websocket-heartbeat? true)
+                (recur conn))
+
+              (= ch shutdown-ch) nil ;;exit
+
+              :else
+              (do ;; feed dead, restart
+                (reset! websocket-heartbeat? nil)
+                (when conn
+                  (try (ws/close conn)
+                       (catch Exception _ nil)))
+                (recur (try (create-feed-client feed-chan)
+                            (catch Exception e
+                              (.printStackTrace e))))))))))
+
+(defn init-feed [feed-shutdown-ch]
+  (defonce feed-chan (a/chan (a/sliding-buffer 100)))
+  (let [pubs (pub-sub feed-chan)
         match-ch (a/chan 1)]
     (a/sub (:by-type pubs) "match" match-ch)
     (keep-current-price-updated match-ch current-price)
+    (keep-feed-running feed-chan (:by-type pubs) feed-shutdown-ch)
     pubs))
 
 (defn on-order-filled-watcher
@@ -190,7 +215,7 @@
   `(http/with-middleware (conj http/default-middleware #'wrap-coinbase-auth)
      ~@body))
 
-(def ^:dynamic *credentials* nil)
+(declare *credentials* nil)
 
 (defn get [url]
   (with-coinbase-auth
@@ -218,12 +243,13 @@
                 (update-in [:balance] read-string)))]
     (map parse-account (-> "/accounts" url get :body json-read-str))))
 
-(defn available-balance "Where currency is \"BTC\", \"USD\" etc"
-  [currency]
-  (->> (accounts)
-       (filter #(= (:currency %) currency))
-       first
-       :available))
+(defn balances 
+  "Returns a map of currency name to balance - pass either :available or :balance"
+  ([k]
+   (into {}
+         (for [[name accts] (group-by :currency (accounts))]
+           [name (-> accts first k)])))
+  ([] (balances :balance)))
 
 (defn place-order
   "Places an order and returns the id."
@@ -289,17 +315,17 @@
                                            mu)
                                          sigma) p)))
 
+
+;; maps probability to fraction of base bet
+;; (should sum to 1 ideally)
 (def probability-bets
-  {0.1 1.0, 0.01 2.0, 0.001 4.0,
-   0.9 1.0, 0.99 2.0, 0.999 4.0}
+  {0.1 0.1, 0.01 0.30, 0.001 0.60,
+   0.9 0.1, 0.99 0.30, 0.999 0.60}
   )
 (def narrow-probability-bets
   {0.25 1.0, 0.15 2.0, 0.1 4.0,
    0.75 1.0, 0.85 2.0, 0.9 4.0})
 
-(def mostly-buy-probability-bets
-  {0.1 0.2, 0.02 1.0, 0.005 2.0
-   0.9 0.05, 0.98 0.2, 0.995 0.4})
 
 (def timescales {60000 [0.002 0.0045] ;; with mu and sigma for lognormal dist
                  (* 10 60000) [0.004 0.012]
@@ -314,72 +340,85 @@
 
 (def round-price (partial round-number 100.0))
 (def round-bitcoin (partial round-number 10000000.0))
-(defn trade-on-change-lifecycle
+
+(defn expire-order
   "When the order is filled, call on-fill-hook with the feed item. If
-   order isn't filled by the ttl, cancel the order."
-  [price size buy? ttl-ms on-fill-hook match-pub]
+   order isn't filled by the ttl, kill the order."
+  [order-id ttl-ms on-fill-hook match-pub]
   (a/go
-    (try (let [order-id (place-order (limit-order buy? size price))
-               fill-ch (a/chan)
-               sub (a/sub match-pub [order-id "match"] fill-ch)]
-           #_(println (format "%s %f at %f, expires in %d ms"
-                            (if buy? "Buying" "Selling")
-                            (float size)
-                            (float price)
-                            ttl-ms))
-           
-           (let [[feed-item _] (a/alts! [fill-ch (a/timeout ttl-ms)])]
-             (if feed-item
-               ;; filled, call on-fill-hook
-               (do (when on-fill-hook
-                    (on-fill-hook feed-item))
-                   feed-item)
-               ;; timed out, cancel
-               (do ;(println "killing order" order-id)
-                   (kill-order order-id)))))
+    (try (let [fill-ch (a/chan 1)
+               sub (a/sub match-pub [order-id "done"] fill-ch)
+               [feed-item _] (a/alts! [fill-ch (a/timeout ttl-ms)])]
+           (if feed-item
+             ;; filled, call on-fill-hook
+             (do (when (and on-fill-hook
+                            (-> feed-item :reason (= "filled")))
+                   (on-fill-hook feed-item))
+                 feed-item)
+             ;; timed out, cancel
+             (kill-order order-id)))
         (catch Exception e
           (.printStackTrace e)))))
 
-(def halt-trading (atom nil))
-
-(defn trade-loop [min-bet probability-bets timescale overlap-factor match-pub shutdown-ch]
+(defn trade-loop [avail-funds-fraction probability-bets timescale overlap-factor match-pub shutdown-ch]
   (a/go-loop []
-    (doseq [[probability bet-scale] (deref probability-bets)]
-      (let [cur-price @current-price
-            [mu sigma] (timescales timescale)
-            exp-price (expected-price cur-price mu sigma probability)
-            rounded-price (round-price exp-price)
-            buy? (< exp-price cur-price)
-            size (round-bitcoin (* min-bet bet-scale))]
-        (a/<! (a/timeout 200))
-        (trade-on-change-lifecycle rounded-price size buy? timescale nil match-pub)))
-    (let [[v ch] (a/alts! [shutdown-ch (a/timeout (int (/ timescale overlap-factor)))])]
-      (when-not (= ch shutdown-ch)
-        (recur))))
-  (kill-all-orders))
+    (let [balances (balances)]
+      (doseq [[probability bet-scale] (deref probability-bets)]
+       (let [cur-price @current-price
+             [mu sigma] (timescales timescale)
+             exp-price (expected-price cur-price mu sigma probability)
+             rounded-price (round-price exp-price)
+             buy? (< exp-price cur-price)
+             amount (round-bitcoin (/ (* (if buy?
+                                           (/ (balances "USD") cur-price)
+                                           (balances "BTC"))
+                                         avail-funds-fraction
+                                         bet-scale)
+                                      overlap-factor))]
+         (when (and @websocket-heartbeat?
+                    (>= amount 0.01)) ;; minimum order
+           (a/<! (a/timeout 200))
+           (let [order-id (place-order (limit-order buy? amount rounded-price))]
+             (expire-order order-id timescale nil match-pub))))))
+    (let [[_ ch] (a/alts! [shutdown-ch (a/timeout (int (/ timescale overlap-factor)))])]
+      (if (= ch shutdown-ch)
+        (kill-all-orders)
+        (recur)))))
 
 (comment
- (expected-price 580.0 0.004 0.012 0.005)
+ (expected-price 580.0 0.004 0.012 0.10)
   (:startup (do
-
-
-
 
               (def *credentials* {:CB-ACCESS-KEY "7b5fe60c0f3d948984191ca4e32e60e6"
                                   :CB-ACCESS-PASSPHRASE "rju2hl21jwq"
                                   :CB-ACCESS-SECRET "U//grHPDjpr3VVGQCCm6A2ZffDVCT0zdkNNSzgcNe0Wh/HUBfp/jd0Sdk0G+JFJ2LEkMN5JByyGvo7ki0P9Njw=="})
-              (defonce feed-client (create-feed-client ws-url))
               
-              (def pubs (pub-sub (:out feed-client)))
-              (let [ch (a/chan )]
+              ;; set up channels and pub/sub (should only be once per repl session)
+              (defonce feed-chan (a/chan (a/sliding-buffer 100)))
+              (defonce pubs (pub-sub feed-chan))
+              (ns-unmap *ns* 'pubs)
+              ;; start the websocket feed
+              (do (def feed-shutdown-ch (a/chan))
+                  (keep-feed-running feed-chan (:by-type pubs) feed-shutdown-ch))
+
+              ;; track current price
+              (let [ch (a/chan (a/sliding-buffer 1))]
                 (a/sub (:by-type pubs) "match" ch)
                 (keep-current-price-updated ch current-price))
-              (let [result-ch (a/chan (a/sliding-buffer 100))]
-                  (doseq [ts (keys timescales)]
-                    (trade-loop 0.001 probability-bets ts 5)))
-            ;; to halt
-            (reset! halt-trading nil)
-            )
+              
+              ;; stop websocket feed
+              (a/close! feed-shutdown-ch)
+              
+              ;; start trading (example)
+              (do (def trade-shutdown (a/chan))
+                  (trade-loop 0.9 #'probability-bets (* 10 60000) 10 (:by-order-id-type pubs) trade-shutdown))
+
+              ;; halt trading
+              (a/close! trade-shutdown)
+
+              ;; total account value in USD
+              (let [b (balances)] (+ (b "USD") (* (b "BTC") @current-price)))
+              )
 
 
   (expected-price 420 0.18 0.3 16 (* 60 60 24 30) 0.75)
