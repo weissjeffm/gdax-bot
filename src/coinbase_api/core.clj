@@ -9,7 +9,9 @@
             [clj-http.client :as http]
             [clojure.data.json :as json]
             [clj-time.format :as timeformat]
-            [clj-time.core :as time])
+            [clj-time.core :as time]
+            [coinbase-api.spec :as sp]
+            [clojure.spec :as s])
   (:import [java.util Base64]
            [javax.crypto.spec SecretKeySpec]
            [javax.crypto Mac]
@@ -26,8 +28,10 @@
 
 (def ws-url "wss://ws-feed-public.sandbox.exchange.coinbase.com")
 (def ws-url "wss://ws-feed.exchange.coinbase.com")
+(def ws-url "wss://ws-feed.gdax.com")
 (def api-url "https://api-public.sandbox.exchange.coinbase.com")
-(def api-url "https://api.exchange.coinbase.com")
+(def api-url "https://api.gdax.com")
+
 
 (defn json-read-str [s]
   (json/read-str s :key-fn keyword))
@@ -215,7 +219,7 @@
   `(http/with-middleware (conj http/default-middleware #'wrap-coinbase-auth)
      ~@body))
 
-(declare *credentials* nil)
+(declare *credentials*)
 
 (defn get [url]
   (with-coinbase-auth
@@ -227,6 +231,12 @@
 
 (defn url [path]
   (format "%s%s" api-url path))
+
+(s/fdef limit-order
+        :args (s/cat :buy? boolean?
+                     :amount :sp/size
+                     :price :sp/price)
+        :ret :coinbase-api.spec/order)
 
 (defn limit-order "Returns a request for a limit order"
   [buy? amount price]
@@ -285,7 +295,7 @@
 
 (defn orders []
   (with-coinbase-auth
-    (http/get (url "/orders") *credentials*)))
+    (-> "/orders" url (http/get *credentials*) :body json-read-str)))
 
 (defn best-orders []
   (-> "/products/BTC-USD/book"
@@ -327,11 +337,14 @@
    0.75 1.0, 0.85 2.0, 0.9 4.0})
 
 
-(def timescales {60000 [0.002 0.0045] ;; with mu and sigma for lognormal dist
-                 (* 10 60000) [0.004 0.012]
-                 (* 100 60000) [0.016 0.032]
-                 (* 1000 60000) [0.032 0.076]
-                 (* 10000 60000) [0.086 0.19]})
+(def base-volatility {60000 [0.002 0.0045] ;; with mu and sigma for lognormal dist
+                      (* 10 60000) [0.004 0.012]
+                      (* 100 60000) [0.016 0.032]
+                      (* 1000 60000) [0.032 0.076]
+                      (* 10000 60000) [0.086 0.19]})
+
+(def timescales base-volatility)
+
 
 (defn round-number
   "Round a double to the given precision (number of significant digits)"
@@ -347,8 +360,10 @@
   [order-id ttl-ms on-fill-hook match-pub]
   (a/go
     (try (let [fill-ch (a/chan 1)
-               sub (a/sub match-pub [order-id "done"] fill-ch)
+               topic [order-id "done"]
+               sub (a/sub match-pub topic fill-ch)
                [feed-item _] (a/alts! [fill-ch (a/timeout ttl-ms)])]
+           (a/unsub match-pub topic fill-ch)
            (if feed-item
              ;; filled, call on-fill-hook
              (do (when (and on-fill-hook
@@ -360,33 +375,69 @@
         (catch Exception e
           (.printStackTrace e)))))
 
-(defn trade-loop [avail-funds-fraction probability-bets timescale overlap-factor match-pub shutdown-ch]
+(defn trade-loop
+  "loop continuously, placing buy/sell orders at intervals.
+
+   avail-funds-fraction: Proportion of overall funds to use up placing
+   orders (approximate), eg 0.9 = 90%. Using too high a value here might result
+   in orders that don't have sufficient funds.
+
+   probability-bets: a reference (var, atom etc) to a mapping of cumulative
+   probability to bet-scale. bet-scale is the proportion of funds to use in
+   this round of orders compared to other probabilities. eg (atom {0.1 0.4,
+   0.01 0.6, 0.9 0.4, 0.99 0.6}) (use 40% of each currency on the 1:10
+   probability, and 60% on the 1:100 probability). Any probability over 0.5 is
+   a sell, under 0.5 is a buy.
+
+   timescale-params: a ref containing a vector of [ttl mu sigma]. The ttl is
+   how long (in ms) the limit order will be in force before it is cancelled (if
+   not already filled). mu and sigma are parameters used to calculate the price
+   to place orders at, given the current price and probability. see
+   expected-price
+
+   overlap-factor: orders stay active for ttl, but if you specify
+   overlap-factor > 1, new orders will be placed before old ones
+   expire. eg, using ttl of 10 minutes and overlap factor of 5 will
+   result in orders being placed every 2 minutes.
+
+   match-pub: a core.async publication to subscribe to order fill
+   messages from the exchange. see pub-sub.
+
+   shutdown-ch: a channel, when you close that channel this loop will exit. It
+   tries to cancel all outstanding orders before exiting, but this is not
+   guaranteed."
+  [avail-funds-fraction probability-bets timescale-params
+                  overlap-factor match-pub shutdown-ch]
   (a/go-loop []
-    (let [balances (balances)]
-      (doseq [[probability bet-scale] (deref probability-bets)]
-       (let [cur-price @current-price
-             [mu sigma] (timescales timescale)
-             exp-price (expected-price cur-price mu sigma probability)
-             rounded-price (round-price exp-price)
-             buy? (< exp-price cur-price)
-             amount (round-bitcoin (/ (* (if buy?
-                                           (/ (balances "USD") cur-price)
-                                           (balances "BTC"))
-                                         avail-funds-fraction
-                                         bet-scale)
-                                      overlap-factor))]
-         (when (and @websocket-heartbeat?
-                    (>= amount 0.01)) ;; minimum order
-           (a/<! (a/timeout 200))
-           (let [order-id (place-order (limit-order buy? amount rounded-price))]
-             (expire-order order-id timescale nil match-pub))))))
-    (let [[_ ch] (a/alts! [shutdown-ch (a/timeout (int (/ timescale overlap-factor)))])]
-      (if (= ch shutdown-ch)
-        (kill-all-orders)
-        (recur)))))
+    (let [[timescale mu sigma] (deref timescale-params)]
+      (try (let [balances (balances)]
+             (doseq [[probability bet-scale] (deref probability-bets)]
+               (let [cur-price @current-price
+                     exp-price (expected-price cur-price mu sigma probability)
+                     rounded-price (round-price exp-price)
+                     buy? (< exp-price cur-price)
+                     amount (round-bitcoin (/ (* (if buy?
+                                                   (/ (balances "USD") cur-price)
+                                                   (balances "BTC"))
+                                                 avail-funds-fraction
+                                                 bet-scale)
+                                              overlap-factor))]
+                 (when (and @websocket-heartbeat?
+                            (>= amount 0.01)) ;; minimum order
+                   (a/<! (a/timeout 200))
+                   (let [order-id (place-order (limit-order buy? amount rounded-price))]
+                     (expire-order order-id timescale nil match-pub))))))
+           (catch Exception e
+             (.printStackTrace e)))
+      ;; wait before starting next round of orders
+      ;; if shutdown channel is closed, kill all orders and exit now
+      (let [[_ ch] (a/alts! [shutdown-ch (a/timeout (int (/ timescale overlap-factor)))])]
+        (if (= ch shutdown-ch)
+          (kill-all-orders)
+          (recur))))))
 
 (comment
- (expected-price 580.0 0.004 0.012 0.10)
+ (expected-price 890.0 0.016 0.020 0.1)
   (:startup (do
 
               (def *credentials* {:CB-ACCESS-KEY "7b5fe60c0f3d948984191ca4e32e60e6"
@@ -396,7 +447,12 @@
               ;; set up channels and pub/sub (should only be once per repl session)
               (defonce feed-chan (a/chan (a/sliding-buffer 100)))
               (defonce pubs (pub-sub feed-chan))
-              (ns-unmap *ns* 'pubs)
+
+              (do
+                (a/close! feed-chan)
+                (ns-unmap *ns* 'feed-chan)
+                (ns-unmap *ns* 'pubs))
+              
               ;; start the websocket feed
               (do (def feed-shutdown-ch (a/chan))
                   (keep-feed-running feed-chan (:by-type pubs) feed-shutdown-ch))
@@ -410,14 +466,42 @@
               (a/close! feed-shutdown-ch)
               
               ;; start trading (example)
-              (do (def trade-shutdown (a/chan))
-                  (trade-loop 0.9 #'probability-bets (* 10 60000) 10 (:by-order-id-type pubs) trade-shutdown))
+              (do
+                (def my-probability-bets (atom {0.1 0.05, 0.01 0.35, 0.001 0.60,
+                                                0.9 0.05, 0.99 0.35, 0.999 0.60}))
+                (def my-timescale (atom [600000 0.004 0.012]))
+                (reset! my-timescale [600000 0.016 0.020])
+                (def trade-shutdown (a/chan))
+                (trade-loop 0.9 my-probability-bets my-timescale 10 (:by-order-id-type pubs) trade-shutdown))
 
+              ;; update trade params
+              (reset! my-probability-bets {0.1 0.1, 0.01 0.30, 0.001 0.60,
+                                           0.9 0.1, 0.99 0.30, 0.999 0.60})
+              (reset! my-timescale [60000 0.016 0.020])
               ;; halt trading
               (a/close! trade-shutdown)
 
+              ;;balances
+              (balances)
+              
+              ;; avg price paid since Jun20
+              (let [b (balances)
+                    starting-usd-bal 9800.0]
+                (/ (- starting-usd-bal (b "USD"))
+                   (b "BTC")))
+
+              ;; profit vs buy and holding btc
+              (let [b (balances)
+                    starting-usd-bal 9800.0
+                    starting-btc-price 700
+                    total-acct-val-now-if-holding (* starting-usd-bal (/ @current-price starting-btc-price))
+                    total-acct-val-now (+ (b "USD") (* (b "BTC") @current-price))]
+                (- total-acct-val-now total-acct-val-now-if-holding))
               ;; total account value in USD
               (let [b (balances)] (+ (b "USD") (* (b "BTC") @current-price)))
+
+              ;;last 20 fills
+              (map #(select-keys % [:side :size :price :created_at])(take 20 (fills)))
               )
 
 
