@@ -437,7 +437,7 @@
           (recur))))))
 
 (comment
- (expected-price 890.0 0.016 0.020 0.1)
+ (expected-price 1200.0 0.04 0.045 0.001)
   (:startup (do
 
               (def *credentials* {:CB-ACCESS-KEY "7b5fe60c0f3d948984191ca4e32e60e6"
@@ -470,7 +470,8 @@
                 (def my-probability-bets (atom {0.1 0.05, 0.01 0.35, 0.001 0.60,
                                                 0.9 0.05, 0.99 0.35, 0.999 0.60}))
                 (def my-timescale (atom [600000 0.004 0.012]))
-                (reset! my-timescale [600000 0.016 0.020])
+                ;(reset! my-timescale [600000 0.016 0.020])
+                (reset! my-timescale [6000000 0.04 0.045]) ; ~2h large spread
                 (def trade-shutdown (a/chan))
                 (trade-loop 0.9 my-probability-bets my-timescale 10 (:by-order-id-type pubs) trade-shutdown))
 
