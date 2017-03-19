@@ -20,7 +20,12 @@
            [org.apache.commons.math3.distribution LogNormalDistribution])
   (:refer-clojure :exclude [get]))
 
-(defonce current-price (atom nil))
+(defonce current-price (atom {}))
+
+(def eth-usd "ETH-USD")
+(def btc-usd "BTC-USD")
+(def eth-btc "ETH-BTC")
+
 (defonce current-order-book (atom {:sequence 0
                                    :bids (sorted-map-by >)
                                    :asks (sorted-map-by <)}))
@@ -36,11 +41,11 @@
 (defn json-read-str [s]
   (json/read-str s :key-fn keyword))
 
-(defn create-feed-client [ch]
+(defn create-feed-client [product-ids ch]
   (println "Creating new feed client")
   (let [conn (ws/connect ws-url :on-receive (fn [v]
                                               (a/put! ch (json-read-str v))))]
-    (ws/send-msg conn (json/write-str {:type "subscribe" :product_id "BTC-USD"}))
+    (ws/send-msg conn (json/write-str {:type "subscribe" :product_ids product-ids}))
     (ws/send-msg conn (json/write-str {:type "heartbeat" :on true}))
     conn))
 
@@ -56,12 +61,12 @@
 (defn keep-current-price-updated [match-ch price-atom]
   (a/go-loop []
     (when-let [match (a/<! match-ch)]
-      (reset! price-atom (-> match :price read-string))
+      (swap! price-atom assoc (:product_id match) (-> match :price read-string))
       (recur))))
 
 (defonce websocket-heartbeat? (atom nil))
 
-(defn keep-feed-running [feed-chan by-type-pub shutdown-ch]
+(defn keep-feed-running [product-ids feed-chan by-type-pub shutdown-ch]
   (let [hb-ch (a/chan (a/sliding-buffer 1))]
     (a/sub by-type-pub "heartbeat" hb-ch)
     (a/go-loop [conn nil]
@@ -79,7 +84,7 @@
                 (when conn
                   (try (ws/close conn)
                        (catch Exception _ nil)))
-                (recur (try (create-feed-client feed-chan)
+                (recur (try (create-feed-client product-ids feed-chan)
                             (catch Exception e
                               (.printStackTrace e))))))))))
 
@@ -239,12 +244,12 @@
         :ret :coinbase-api.spec/order)
 
 (defn limit-order "Returns a request for a limit order"
-  [buy? amount price]
+  [buy? product-id amount price]
   {:type "limit"
    :side (if buy? "buy" "sell")
    :price price
    :size amount
-   :product_id "BTC-USD"})
+   :product_id product-id})
 
 (defn accounts []
   (letfn [(parse-account [acct]
@@ -349,10 +354,15 @@
 (defn round-number
   "Round a double to the given precision (number of significant digits)"
   [factor p]
-  (/ (Math/round (* p factor)) factor))
+  (float (/ (Math/round (* p factor)) factor)))
 
-(def round-price (partial round-number 100.0))
-(def round-bitcoin (partial round-number 10000000.0))
+(def round-factor {"USD" 100
+                   "BTC" 100000
+                   "ETH" 100000})
+
+(defn round-price [unit amount]
+  (round-number (clojure.core/get round-factor unit)
+                amount))
 
 (defn expire-order
   "When the order is filled, call on-fill-hook with the feed item. If
@@ -406,29 +416,33 @@
    shutdown-ch: a channel, when you close that channel this loop will exit. It
    tries to cancel all outstanding orders before exiting, but this is not
    guaranteed."
-  [avail-funds-fraction probability-bets timescale-params
-                  overlap-factor match-pub shutdown-ch]
+  [product-ids avail-funds-fraction probability-bets timescale-params
+   overlap-factor match-pub shutdown-ch]
   (a/go-loop []
     (let [[timescale mu sigma] (deref timescale-params)]
-      (try (let [balances (balances)]
-             (doseq [[probability bet-scale] (deref probability-bets)]
-               (let [cur-price @current-price
+      (let [balances (balances)]
+        (doseq [product-id product-ids
+                [probability bet-scale] (deref probability-bets)]
+          (try (let [cur-price (-> current-price deref (clojure.core/get product-id))
+                     [base-unit quote-unit] (clojure.string/split product-id #"-")
                      exp-price (expected-price cur-price mu sigma probability)
-                     rounded-price (round-price exp-price)
+                     rounded-price (round-price quote-unit exp-price)
                      buy? (< exp-price cur-price)
-                     amount (round-bitcoin (/ (* (if buy?
-                                                   (/ (balances "USD") cur-price)
-                                                   (balances "BTC"))
-                                                 avail-funds-fraction
-                                                 bet-scale)
-                                              overlap-factor))]
+                     amount (round-price base-unit
+                                         (/ (* (if buy?
+                                                 (/ (balances quote-unit) cur-price)
+                                                 (balances base-unit))
+                                               avail-funds-fraction
+                                               bet-scale)
+                                            overlap-factor))]
                  (when (and @websocket-heartbeat?
                             (>= amount 0.01)) ;; minimum order
                    (a/<! (a/timeout 200))
-                   (let [order-id (place-order (limit-order buy? amount rounded-price))]
-                     (expire-order order-id timescale nil match-pub))))))
-           (catch Exception e
-             (.printStackTrace e)))
+                   (let [order (limit-order buy? product-id amount rounded-price)
+                         order-id (place-order order)]
+                     (expire-order order-id timescale nil match-pub))))
+               (catch Exception e
+                 (.printStackTrace e)))))
       ;; wait before starting next round of orders
       ;; if shutdown channel is closed, kill all orders and exit now
       (let [[_ ch] (a/alts! [shutdown-ch (a/timeout (int (/ timescale overlap-factor)))])]
@@ -437,7 +451,19 @@
           (recur))))))
 
 (comment
- (expected-price 1200.0 0.04 0.045 0.001)
+  [{:product-id "BTC-USD"
+    :funds 0.45
+    :probability 0.1
+    :mu 0.0
+    :sigma 0.03
+    :ttl 600000
+    :overlap 10
+    }]
+  (let [ep #(expected-price % 0.0 0.030 0.1)
+        prices [1155 45 0.01]
+        buy-prices (map ep prices)]
+    buy-prices)
+  (expected-price 30.0 0.00 0.035 0.1)
   (:startup (do
 
               (def *credentials* {:CB-ACCESS-KEY "7b5fe60c0f3d948984191ca4e32e60e6"
@@ -455,7 +481,7 @@
               
               ;; start the websocket feed
               (do (def feed-shutdown-ch (a/chan))
-                  (keep-feed-running feed-chan (:by-type pubs) feed-shutdown-ch))
+                  (keep-feed-running [eth-usd btc-usd eth-btc] feed-chan (:by-type pubs) feed-shutdown-ch))
 
               ;; track current price
               (let [ch (a/chan (a/sliding-buffer 1))]
@@ -467,13 +493,15 @@
               
               ;; start trading (example)
               (do
-                (def my-probability-bets (atom {0.1 0.05, 0.01 0.35, 0.001 0.60,
-                                                0.9 0.05, 0.99 0.35, 0.999 0.60}))
+                (def my-probability-bets (atom {0.1 0.10, 0.01 0.30, 0.001 0.60,
+                                                0.9 0.10, 0.99 0.30, 0.999 0.60}))
                 (def my-timescale (atom [600000 0.004 0.012]))
-                ;(reset! my-timescale [600000 0.016 0.020])
-                (reset! my-timescale [6000000 0.04 0.045]) ; ~2h large spread
+                ;;(reset! my-timescale [600000 0.016 0.020])
+                ;;(reset! my-timescale [6000000 0.04 0.045]) ; ~2h large spread
+                (reset! my-timescale [6000000 0.00 0.045]) ;; no mu for multiple currencies
+                ;;(reset! my-timescale [6000000 0.02 0.035]) medium spread
                 (def trade-shutdown (a/chan))
-                (trade-loop 0.9 my-probability-bets my-timescale 10 (:by-order-id-type pubs) trade-shutdown))
+                (trade-loop [btc-usd eth-usd eth-btc] 0.45 my-probability-bets my-timescale 10 (:by-order-id-type pubs) trade-shutdown))
 
               ;; update trade params
               (reset! my-probability-bets {0.1 0.1, 0.01 0.30, 0.001 0.60,
@@ -499,7 +527,9 @@
                     total-acct-val-now (+ (b "USD") (* (b "BTC") @current-price))]
                 (- total-acct-val-now total-acct-val-now-if-holding))
               ;; total account value in USD
-              (let [b (balances)] (+ (b "USD") (* (b "BTC") @current-price)))
+              (let [b (balances)] (+ (b "USD")
+                                     (* (b "BTC") (-> current-price deref (clojure.core/get "BTC-USD")))
+                                     (* (b "ETH") (-> current-price deref (clojure.core/get "ETH-USD")))))
 
               ;;last 20 fills
               (map #(select-keys % [:side :size :price :created_at])(take 20 (fills)))
